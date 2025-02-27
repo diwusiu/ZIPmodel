@@ -1,0 +1,617 @@
+---
+title: "CountModel"
+author: "Di Wu"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+params:
+  year: 2002
+  type: MC
+  region: Wyoming
+  normalize: TRUE
+  work.dir: E:/CUBoulder-postdoc/GrassHopper/Grasshopper_prediction/Grasshopper_prediction
+  data.dir: E:/CUBoulder-postdoc/USDA-Grasshopper-Covariates/USDA-Grasshopper/
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+
+library(dplyr)
+library(RColorBrewer)
+library(magrittr)
+library(knitr)
+library(gridExtra)
+
+library(units) # conda
+library(sf) # conda
+library(fmesher)
+library(terra) # conda (using conda for 4.4.2, not 4.4.1)
+library(spatstat)
+library(ncdf4) # conda
+library(daymetr)
+library(raster)
+library(dismo)
+library(ggplot2)
+# options(repos = c(
+#   INLA = "https://inla.r-inla-download.org/R/testing",
+#   CRAN = "https://cloud.r-project.org"
+# )) # don't use it when install on HPC
+# install packages by specific versions on HPC
+library(INLA)
+library(inlabru)
+library(patchwork)
+
+# We want to obtain CPO data from the estimations
+bru_options_set(control.compute = list(cpo = TRUE))
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r survey_loc}
+
+set.seed(1)
+
+year <- params$year
+year.pr <- year-1
+
+survey.type <- params$type # GH | MC
+region.name <- params$region 
+if (region.name == "Nevada") region.code <- "NV" else region.code <-  "WY"
+paste(year, survey.type, region.name, "(Apr. to Aug.)")
+
+setwd(params$work.dir) 
+root_folder <- params$data.dir
+paste("Working directory: ", params$work.dir)
+paste("Dataset directory: ", params$data.dir)
+
+path.survey <- paste0(root_folder, "SurveyData/grasshoppers_10192022/APHIS_split_GH_MC/GHMC_Survey_", year, "_", survey.type,"_WY_UTM_wabs.csv")
+survey <- read.csv(path.survey)
+
+if (survey.type == "MC") {
+  data <- survey[survey$STATE==region.code, c("X", "Y", "DATE","MCDENSITY")]
+  } else {
+    data <- survey[survey$STATE==region.code, c("X", "Y", "DATE","GHDENSITY")]
+  }
+stopifnot(nrow(data) > 10)
+
+research.boundary <- sf::st_read(dsn = paste0(root_folder, "WY_UTM13/cb_2018_us_state_500k_",region.name,"_UTM.shp"),
+                                layer = paste0("cb_2018_us_state_500k_", region.name,"_UTM"), quiet=TRUE)
+research.crs <- raster::crs(research.boundary)
+
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+```{r generate topo}
+# generate topo tif
+# demUS <- raster(paste0(root_folder, "dem/elevation_1KMmd_GMTEDmd_continent.tif"))
+demUS <- raster(paste0(root_folder, "WY_UTM13/DEM_WY_UTM.tif"))
+triUS <- terrain(demUS, opt = "TRI", unit = "radians")
+
+
+file_tri <- paste0(root_folder, "TopoData/TRI_",region.code,"_UTM.tif")
+
+if (!file.exists(file_tri)){
+  triUS <- terrain(demUS, opt = "TRI", unit = "radians")
+  writeRaster(triUS, filename = file_tri, format = "GTiff", overwrite = TRUE)
+} else {
+  triUS <- raster(file_tri)
+}  
+```
+
+## Process climate dataset within the research boundary
+
+### Define data processing function
+
+```{r climate_datasets}
+crop.dataset <- function(year, research.crs, research.boundary, research.month){
+  extractByMask <- function(raster){
+    boundary <- st_transform(research.boundary, crs(raster))
+    return (suppressWarnings(mask(crop(raster, extent(boundary)), boundary)))
+  }
+  
+  # dem, slope, aspect, tmean, pmean, ndvi, soil.moisture, tri
+  dem <- raster(paste0(root_folder, "WY_UTM13/DEM_WY_UTM.tif"))
+  dem <- extractByMask(dem)
+  
+  tri <- raster(paste0(root_folder, "TopoData/TRI_",region.code,"_UTM.tif"))
+  tri <- extractByMask(tri)
+  
+  roughness <- raster(paste0(root_folder, "TopoData/roughness.tif"))
+  roughness <- extractByMask(roughness)
+  
+  slope <- raster(paste0(root_folder, "WY_UTM13/Slope_WY_UTM.tif"))
+  slope <- extractByMask(slope)
+  
+  aspect <- raster(paste0(root_folder, "WY_UTM13/aspect_WY_UTM.tif"))
+  aspect <- extractByMask(aspect)
+  
+  ndvi <- raster(paste0(root_folder, "WY_UTM13/NDVI_", region.name, "_2002_month4-8_mean_UTM.tif"))
+  ndvi <- extractByMask(ndvi)
+  
+  # NDVI, 5 quarters (from previous summer to this summer)
+  ndvi.summer.pr <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_summer_", year.pr, "_UTM.tif"))
+  ndvi.summer.pr <- extractByMask(ndvi.summer.pr)
+  
+  ndvi.fall.pr <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_fall_", year.pr, "_UTM.tif"))
+  ndvi.fall.pr <- extractByMask(ndvi.fall.pr)
+  
+  ndvi.winter.pr <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_winter_", year.pr, "_UTM.tif"))
+  ndvi.winter.pr <- extractByMask(ndvi.winter.pr)
+  
+  ndvi.spring <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_spring_", year, "_UTM.tif"))
+  ndvi.spring <- extractByMask(ndvi.spring)
+  
+  ndvi.summer <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_summer_", year, "_UTM.tif"))
+  ndvi.summer <- extractByMask(ndvi.summer)
+  
+  
+  
+  # soil moisture, 5 quarters
+  soil.moisture.summer.pr <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_summer_", year.pr, "_mean_UTM.tif"))
+  soil.moisture.summer.pr <- extractByMask(soil.moisture.summer.pr)
+  
+  soil.moisture.fall.pr <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_fall_", year.pr, "_mean_UTM.tif"))
+  soil.moisture.fall.pr <- extractByMask(soil.moisture.fall.pr)  
+
+  soil.moisture.winter.pr <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_winter_", year.pr, "_mean_UTM.tif"))
+  soil.moisture.winter.pr <- extractByMask(soil.moisture.winter.pr)  
+  
+  soil.moisture.spring <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_spring_", year, "_mean_UTM.tif"))
+  soil.moisture.spring <- extractByMask(soil.moisture.spring)  
+  
+  soil.moisture.summer <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_summer_", year, "_mean_UTM.tif"))
+  soil.moisture.summer <- extractByMask(soil.moisture.summer)  
+  
+  
+  
+  project.back <- function(raster){
+    raster <- projectRaster(raster, to=ndvi, method="ngb")
+    raster <- projectRaster(raster, crs=research.crs, method="ngb")
+    return (raster)
+  }
+  dem <- project.back(dem)
+  aspect <- project.back(aspect)
+  slope <- project.back(slope)
+  tri <- project.back(tri) # tri
+  
+  ndvi.summer.pr <- project.back(ndvi.summer.pr)
+  ndvi.fall.pr <- project.back(ndvi.fall.pr)
+  ndvi.winter.pr <- project.back(ndvi.winter.pr)
+  ndvi.spring <- project.back(ndvi.spring)
+  ndvi.summer <- project.back(ndvi.summer)
+  
+  soil.moisture.summer.pr <- project.back(soil.moisture.summer.pr)
+  soil.moisture.fall.pr <- project.back(soil.moisture.fall.pr)
+  soil.moisture.winter.pr <- project.back(soil.moisture.winter.pr)
+  soil.moisture.spring <- project.back(soil.moisture.spring)
+  soil.moisture.summer <- project.back(soil.moisture.summer)
+  
+  
+  return (c(dem=dem, aspect=aspect, slope=slope, 
+            # tmean=tmean, pmean=pmean,
+            ndvi.summer.pr=ndvi.summer.pr, 
+            ndvi.fall.pr=ndvi.fall.pr, 
+            ndvi.winter.pr=ndvi.winter.pr, 
+            ndvi.spring=ndvi.spring, 
+            ndvi.summer=ndvi.summer,
+            
+            soil.moisture.summer.pr=soil.moisture.summer.pr,
+            soil.moisture.fall.pr=soil.moisture.fall.pr,
+            soil.moisture.winter.pr=soil.moisture.winter.pr,
+            soil.moisture.spring=soil.moisture.spring,
+            soil.moisture.summer=soil.moisture.summer,
+            
+            tri=tri))
+}
+
+get.climateVars <- function(data, geometry){
+  # Extract pixel value from data for given location (geometry)
+  values <- raster::extract(data, st_as_sf(geometry, crs=research.crs))
+  return (values)
+}
+# check NAN
+check.isna.climateVars <- function(dataset, loc){
+  loc_idx <- rep(TRUE, nrow(loc))
+  for (idx in 1:length(dataset)){
+    values <- get.climateVars(dataset[[idx]], SpatialPoints(coords = loc))
+    if (any(is.na(values))) loc_idx <- loc_idx & !is.na(values)
+  }
+  return (loc_idx)
+}
+```
+
+
+
+```{r generate_dataset, fig.width=14, fig.height=if (region.name == "Wyoming") 20 else 32}
+path.dataset <- paste0("Datasets/", region.name, "/Dataset.", region.name, ".", year, "_allQ_UTM.Rds")
+
+tmean <- readRDS(paste0(root_folder, "daymetQuarter/", region.name, "/daymetQuarter.t.", region.name, ".", year, "_UTM.Rds"))
+pmean <- readRDS(paste0(root_folder, "daymetQuarter/", region.name, "/daymetQuarter.p.", region.name, ".", year, "_UTM.Rds"))
+
+
+if (!file.exists(path.dataset)){
+  dataset <- crop.dataset(year, research.crs, research.boundary, research.month) # (very slow)
+  
+  for (name in names(tmean)) {
+    dataset[[name]] <- tmean[[name]]
+  }
+  for (name in names(pmean)) {
+    dataset[[name]] <- pmean[[name]]
+  }
+  
+  saveRDS(dataset, file = path.dataset)
+} else {
+  dataset <- readRDS(path.dataset)
+}
+data <- data[check.isna.climateVars(dataset, data[,1:2]),]
+stopifnot(nrow(data) > 10)
+data.sf <- sf::st_as_sf(data, coords = c("X","Y"), crs=research.crs)
+
+# plot covariates
+covariates.subplot <- function(rasterLayer, legend, title){
+  df <- data.frame(rasterToPoints(rasterLayer))
+  pl <- ggplot() +
+    geom_raster(data = df, mapping = aes(x=x,y=y, fill=df[,3])) +
+    ggtitle(title) +
+    scale_fill_viridis_c() +
+    labs(y = "Y", x = "X")
+  pl$labels$fill <- legend
+  return (pl)
+}
+
+
+covariates.plot <- gridExtra::grid.arrange(
+  covariates.subplot(dataset$dem, "m", "DEM"),
+  covariates.subplot(dataset$slope, "slope", "Slope"),
+  covariates.subplot(dataset$aspect, "aspect", "Aspect"),
+  covariates.subplot(dataset$tri, "tri", "TRI"),
+  
+  covariates.subplot(dataset$summer.pr_tmean, "degree", "Temperature (Jun.pr. to Aug.pr.)"),
+  covariates.subplot(dataset$fall.pr_tmean, "degree", "Temperature (Sept.pr. to Nov.pr.)"),
+  covariates.subplot(dataset$winter.pr_tmean, "degree", "Temperature (Dec.pr. to Feb.)"),
+  covariates.subplot(dataset$spring_tmean, "degree", "Temperature (Mar. to May)"),
+  covariates.subplot(dataset$summer_tmean, "degree", "Temperature (Jun. to Aug.)"),
+  
+  covariates.subplot(dataset$summer.pr_pmean, "mm", "Precpitation (Jun.pr. to Aug.pr.)"),
+  covariates.subplot(dataset$fall.pr_pmean, "mm", "Precpitation (Sept.pr. to Nov.pr.)"),
+  covariates.subplot(dataset$winter.pr_pmean, "mm", "Precpitation (Dec.pr. to Feb.)"),
+  covariates.subplot(dataset$spring_pmean, "mm", "Precpitation (Mar. to May)"),
+  covariates.subplot(dataset$summer_pmean, "mm", "Precpitation (Jun. to Aug.)"),
+  
+  covariates.subplot(dataset$ndvi.summer.pr, "ndvi.summer.pr", "NDVI.summer.pr"),
+  covariates.subplot(dataset$ndvi.fall.pr, "ndvi.fall.pr", "NDVI.fall.pr"),
+  covariates.subplot(dataset$ndvi.winter.pr, "ndvi.winter.pr", "NDVI.winter.pr"),
+  covariates.subplot(dataset$ndvi.spring, "ndvi.spring", "NDVI.spring"),
+  covariates.subplot(dataset$ndvi.summer, "ndvi.summer", "NDVI.summer"),
+  
+  covariates.subplot(dataset$soil.moisture.summer.pr, "cm3/cm3", "Soil Moisture.summer.pr"),
+  covariates.subplot(dataset$soil.moisture.fall.pr, "cm3/cm3", "Soil Moisture.fall.pr"),
+  covariates.subplot(dataset$soil.moisture.winter.pr, "cm3/cm3", "Soil Moisture.winter.pr"),
+  covariates.subplot(dataset$soil.moisture.spring, "cm3/cm3", "Soil Moisture.spring"),
+  covariates.subplot(dataset$soil.moisture.summer, "cm3/cm3", "Soil Moisture.summer"),
+  ncol = 2)
+  
+
+if (params$normalize){
+  data.normalize <- function(data) ((data - cellStats(data, stat='mean')) / cellStats(data, stat='sd'))
+  for (idx in 1:length(dataset)) dataset[[idx]] <- data.normalize(dataset[[idx]])
+}
+```
+```{r mesh create}
+
+# Domain
+mesh <- fmesher::fm_mesh_2d_inla(
+  loc = st_intersection(st_as_sfc(data.sf), st_buffer(research.boundary, -500)),
+  # loc.domain=st_coordinates(research.boundary)[,1:2],
+  boundary=research.boundary,
+  max.edge = c(30000, 70000),
+  # offset = c(3000, 3000), cutoff = 1000,
+                                 crs=research.crs)
+summary(mesh)
+
+matern <- INLA::inla.spde2.pcmatern(
+  mesh,
+  prior.sigma = c(0.01, 0.05), # A prior distribution is applied to the spatial process' standard deviation.  prior on sigma: P(sigma > sigma0) = 0.05
+  prior.range = c(15000, 0.05) # A prior is applied to the range parameter. prior on range: P(range < range0) = 0.05
+) 
+
+ggplot() +
+  geom_fm(data = mesh) +
+  geom_sf(
+    data = data.sf[data.sf$MCDENSITY > 0, ],
+    aes(color = MCDENSITY),
+    size = 1,
+    pch = 4
+  ) +
+  theme_minimal()
+
+
+
+```
+```{r dataset transfer}
+dataset_spat <- lapply(dataset, terra::rast) # from raster::rasterLayer to terra::SpatRas
+
+
+for (i in seq_along(dataset_spat)) {
+  values(dataset_spat[[i]])[is.na(values(dataset_spat[[i]]))] <- 0
+}
+
+```
+
+
+```{r fit}
+
+cmap <- ~ dem(dataset_spat$dem, model = "linear") +
+  slope(dataset_spat$slope, model = "linear") +
+  aspect(dataset_spat$aspect, model = "linear") +
+  tri(dataset_spat$tri, model = "linear") +
+
+  summer.pr_tmean(dataset_spat$summer.pr_tmean, model = "linear") +
+  fall.pr_tmean(dataset_spat$fall.pr_tmean, model = "linear") +
+  winter.pr_tmean(dataset_spat$winter.pr_tmean, model = "linear") +
+  spring_tmean(dataset_spat$spring_tmean, model = "linear") +
+  summer_tmean(dataset_spat$summer_tmean, model = "linear") +
+
+  summer.pr_pmean(dataset_spat$summer.pr_pmean, model = "linear") +
+  fall.pr_pmean(dataset_spat$fall.pr_pmean, model = "linear") +
+  winter.pr_pmean(dataset_spat$winter.pr_pmean, model = "linear") +
+  spring_pmean(dataset_spat$spring_pmean, model = "linear") +
+  summer_pmean(dataset_spat$summer_pmean, model = "linear") +
+
+  ndvi.summer.pr(dataset_spat$ndvi.summer.pr, model = "linear") +
+  ndvi.fall.pr(dataset_spat$ndvi.fall.pr, model = "linear") +
+  ndvi.winter.pr(dataset_spat$ndvi.winter.pr, model = "linear") +
+  ndvi.spring(dataset_spat$ndvi.spring, model = "linear") +
+  ndvi.summer(dataset_spat$ndvi.summer, model = "linear") +
+
+  soil.moisture.summer.pr(dataset_spat$soil.moisture.summer.pr, model = "linear") +
+  soil.moisture.fall.pr(dataset_spat$soil.moisture.fall.pr, model = "linear") +
+  soil.moisture.winter.pr(dataset_spat$soil.moisture.winter.pr, model = "linear") +
+  soil.moisture.spring(dataset_spat$soil.moisture.spring, model = "linear") +
+  soil.moisture.summer(dataset_spat$soil.moisture.summer, model = "linear") +
+
+  field(geometry, model = matern) + Intercept(1)
+
+
+path.model.Poi <- paste0("ZIP_ZAP/Models/", region.name, "/", survey.type, "/Model.", region.name, ".", survey.type, ".", year, "_Poisson.Rds")
+if (!file.exists(path.model.Poi)){
+
+  fit_poisson <- bru(
+    cmap,
+    bru_obs(
+      family = "poisson", data = data.sf,
+      formula = MCDENSITY ~
+        dem + 
+        slope + aspect + tri +
+        summer.pr_tmean + fall.pr_tmean + winter.pr_tmean + spring_tmean + summer_tmean +
+        summer.pr_pmean + fall.pr_pmean + winter.pr_pmean + spring_pmean + summer_pmean +
+        ndvi.summer.pr + ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+        soil.moisture.summer.pr + soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+        field +
+        Intercept,
+      
+    )
+  )
+    saveRDS(fit_poisson, file = path.model.Poi)
+} else {
+  fit_poisson <- readRDS(path.model.Poi)
+}
+
+summary(fit_poisson)
+
+
+```
+
+
+
+```{r create pred-grid}
+
+# rasterize
+points_vect_pre <- vect(data.sf)
+
+template_raster_pre <- terra::rast(paste0(root_folder, "WY_UTM13/DEM_WY_UTM.tif"))
+
+counts_rstr_pre <-
+  terra::rasterize(points_vect_pre, template_raster_pre, field = "MCDENSITY", fun = "mean", background = 0) %>%
+  # terra::aggregate(fact = 1, fun = sum) %>%
+  mask(vect(sf::st_geometry(research.boundary)))
+
+plot(counts_rstr_pre)
+
+# cell size
+counts_rstr_pre <- counts_rstr_pre %>% 
+  cellSize(unit = "km") %>%  # calculate the area of each cell with unit km2
+  c(counts_rstr_pre)  # merge the area information to original raster. 
+  # 'counts_rstr_pre' has two layers now. one is count #, another is area information.
+
+# MCdensity data frame for prediction
+counts_pre_df <- crds(counts_rstr_pre, df = TRUE, na.rm = TRUE) %>%
+  bind_cols(values(counts_rstr_pre, mat = TRUE, na.rm = TRUE)) %>%
+  rename(MCDENSITYmean = mean) %>%
+  mutate(present = (MCDENSITYmean > 0) * 1L) %>%
+  st_as_sf(coords = c("x", "y"), crs = research.crs) %>%
+  mutate(MCDENSITYmean = ceiling(MCDENSITYmean)) # int & >0
+```
+
+
+```{r poisson pred}
+path.pred.Poi <- paste0("ZIP_ZAP/Preds/", region.name, "/", survey.type, "/Pred.", region.name, ".", survey.type, ".", year, "_Poisson.Rds")
+
+
+if (!file.exists(path.pred.Poi)){
+
+  pred_poisson <- predict(
+    fit_poisson, 
+    counts_pre_df,
+    ~ {
+      expect <- exp( dem + 
+                       slope + aspect + tri +
+                       summer.pr_tmean + fall.pr_tmean + winter.pr_tmean + spring_tmean + summer_tmean +
+                       summer.pr_pmean + fall.pr_pmean + winter.pr_pmean + spring_pmean + summer_pmean +
+                       ndvi.summer.pr + ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+                       soil.moisture.summer.pr + soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+                       field + Intercept
+      )
+      list(
+        expect = expect,
+        obs_prob = dpois(MCDENSITYmean, expect)
+      )
+    },
+    n.samples = 2500
+  )
+  saveRDS(pred_poisson, file = path.pred.Poi)
+} else {
+  pred_poisson <- readRDS(path.pred.Poi)
+}  
+  
+  
+# For Poisson, the posterior conditional variance is equal to
+# the posterior conditional mean, so no need to compute it separately.
+expect_poisson <- pred_poisson$expect # including mean predicted intensity & sd
+expect_poisson$pred_var <- expect_poisson$mean + expect_poisson$sd^2 # variance
+expect_poisson$log_score <- -log(pred_poisson$obs_prob$mean) # Negative Log-Likelihood, NLL
+# NLL is smaller, the prediction is better
+
+pl.poisson <-ggplot() +
+  geom_fm(data = mesh) +
+  gg(expect_poisson, aes(fill = mean), geom = "tile") +
+  geom_sf(data = data.sf, color = "firebrick", size = 1, pch = 4, alpha = 0.6) +
+  ggtitle("MC intensity in Wyoming (poisson), 2002")
+
+ggsave(file=paste0("ZIP_ZAP/Plots/", region.name, "/", survey.type, "/Plot.", region.name, ".", survey.type, ".", year, "_Poisson.png"),
+       plot=pl.poisson, width=7, height=if (region.name == "Wyoming") 5 else 8, dpi=300)
+
+pl.poisson
+
+# save tif
+coor.pred.poisson <- st_coordinates(expect_poisson$geometry)
+
+raster_poisson_pre <- data.frame(x = coor.pred.poisson[,1],
+                          y = coor.pred.poisson[,2],
+                          mean = expect_poisson$mean)
+
+r_poisson_pre <- rasterFromXYZ(raster_poisson_pre[, c("x", "y", "mean")])
+crs(r_poisson_pre) <- st_crs(research.boundary)$proj4string
+
+output_tif <- paste0("ZIP_ZAP/Plots/", region.name, "/", survey.type, 
+                     "/Plot.", region.name, ".", survey.type, ".", 
+                     year, "_Poisson.tif")
+writeRaster(r_poisson_pre, output_tif, format = "GTiff", overwrite = TRUE)
+
+
+```
+
+
+```{r ZIP}
+
+path.model.Z <- paste0("ZIP_ZAP/Models/", region.name, "/", survey.type, "/Model.", region.name, ".", survey.type, ".", year, "_ZIP.Rds")
+if (!file.exists(path.model.Z)){
+
+  fit_ZIP <- bru(
+    cmap,
+    bru_obs(
+      family = "zeroinflatedpoisson1", data = data.sf,
+      formula = MCDENSITY ~
+        dem + 
+        slope + aspect + tri +
+        summer.pr_tmean + fall.pr_tmean + winter.pr_tmean + spring_tmean + summer_tmean +
+        summer.pr_pmean + fall.pr_pmean + winter.pr_pmean + spring_pmean + summer_pmean +
+        ndvi.summer.pr + ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+        soil.moisture.summer.pr + soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+        field +
+        Intercept,
+      
+    )
+  )
+    saveRDS(fit_ZIP, file = path.model.Z)
+} else {
+  fit_ZIP <- readRDS(path.model.Z)
+}
+
+summary(fit_ZIP)
+
+
+```
+
+```{r ZIP prediction}
+
+
+path.pred.Z <- paste0("ZIP_ZAP/Preds/", region.name, "/", survey.type, "/Pred.", region.name, ".", survey.type, ".", year, "_ZIP.Rds")
+
+
+if (!file.exists(path.pred.Z)){
+
+  pred_ZIP <- predict(
+    fit_ZIP, 
+    counts_pre_df,
+    ~ {
+      scaling_prob <- (1 - zero_probability_parameter_for_zero_inflated_poisson_1)
+      lambda <- exp( dem + 
+                       slope + aspect + tri +
+                       summer.pr_tmean + fall.pr_tmean + winter.pr_tmean + spring_tmean + summer_tmean +
+                       summer.pr_pmean + fall.pr_pmean + winter.pr_pmean + spring_pmean + summer_pmean +
+                       ndvi.summer.pr + ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+                       soil.moisture.summer.pr + soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+                       field + Intercept
+      )
+      expect_param <- lambda
+      expect <- scaling_prob * expect_param
+      variance <- scaling_prob * expect_param *
+        (1 + (1 - scaling_prob) * expect_param)
+    list(
+      lambda = lambda,
+      expect = expect,
+      variance = variance,
+      obs_prob = (1 - scaling_prob) * (MCDENSITYmean == 0) +
+        scaling_prob * dpois(MCDENSITYmean, expect_param)
+      )
+    },
+
+    n.samples = 2500
+  )
+  saveRDS(pred_ZIP, file = path.pred.Z)
+} else {
+  pred_ZIP <- readRDS(path.pred.Z)
+}  
+  
+expect_ZIP <- pred_ZIP$expect
+expect_ZIP$pred_var <- pred_ZIP$variance$mean + expect_ZIP$sd^2
+expect_ZIP$log_score <- -log(pred_ZIP$obs_prob$mean)
+
+
+pl.ZIP <-ggplot() +
+  geom_fm(data = mesh) +
+  gg(expect_ZIP, aes(fill = mean), geom = "tile") +
+  geom_sf(data = data.sf, color = "firebrick", size = 1, pch = 4, alpha = 0.6) +
+  ggtitle("MC intensity in Wyoming (ZIP), 2002")
+
+ggsave(file=paste0("ZIP_ZAP/Plots/", region.name, "/", survey.type, "/Plot.", region.name, ".", survey.type, ".", year, "_ZIP.png"),
+       plot=pl.ZIP, width=7, height=if (region.name == "Wyoming") 5 else 8, dpi=300)
+
+pl.ZIP
+
+# save tif
+coor.pred.ZIP <- st_coordinates(expect_ZIP$geometry)
+
+raster_ZIP_pre <- data.frame(x = coor.pred.ZIP[,1],
+                          y = coor.pred.ZIP[,2],
+                          mean = expect_ZIP$mean)
+
+r_ZIP_pre <- rasterFromXYZ(raster_ZIP_pre[, c("x", "y", "mean")])
+crs(r_ZIP_pre) <- st_crs(research.boundary)$proj4string
+
+output_tif_ZIP <- paste0("ZIP_ZAP/Plots/", region.name, "/", survey.type, 
+                     "/Plot.", region.name, ".", survey.type, ".", 
+                     year, "_ZIP.tif")
+writeRaster(r_ZIP_pre, output_tif_ZIP, format = "GTiff", overwrite = TRUE)
+
+```
+
